@@ -1,0 +1,288 @@
+This code is to bring all the data together :) First, some data wrangling has to be done though
+
+packages
+```{r}
+require("tidyverse")
+require("readxl")
+require("sf")
+```
+
+DIS
+```{r}
+load("C:/Users/Michel/Uni/BA Arbeit/inequality_social_drought/impacts_dataset_export_validation.RData")
+
+# not all nuts3 are represented in the dataset... why? here I add all the nuts regions
+impacts_control <- filter(impacts_dataset, nchar(nuts_id) == 5) #extract all nuts3
+control <- unique(impacts_control$nuts_id) #save all that is present to a vector
+
+shape <- readRDS("shape.rds") %>% filter(levl_code == 3) #shape is official shapefile dataset and therefore complete with all 401 nuts3 regions
+test <- shape$nuts_id #safe as vector
+diff <- setdiff(test, control) #save the difference! this is what is missing
+
+#now I create a dataset with all the missing entries that I suspect do not have any DIS recorded!
+
+missings <- as.data.frame(
+  expand.grid(
+    nuts_id = diff,
+    month_date = c(1:12),
+    year_date = c(2000:2022),
+    statistical_unit = "nuts3",
+    MIS = 0,
+    type_of_class = NA
+  )
+)
+# only thing missing now is the number of articles, these will have to be merged
+
+articles <- select(impacts_dataset, c(year_date, articles)) %>%  unique() #extract articles per year
+missings <- left_join(missings, articles, by = "year_date") #merge data
+impacts_dataset <- rbind(impacts_dataset, missings) #rbins missings and impacts together
+rm(articles, control, test, diff, missings, shape, impacts_control) #remove unnecessary vectors
+
+# create identifiers
+impacts_dataset$year_nuts <-
+  paste0(impacts_dataset$year_date, "_", impacts_dataset$nuts_id) #create location and year identifier
+
+help_MIS <-
+  select(impacts_dataset, year_nuts) %>% unique() #extract unique location and years
+
+for (i in 1:length(help_MIS$year_nuts)) {
+  help_MIS[i, "MIS_year"] <-
+    sum(filter(impacts_dataset, year_nuts == help_MIS[i, 1])$MIS)
+} # Code for calculating total MIS for a year
+
+impacts_dataset <- left_join(impacts_dataset, help_MIS, by = "year_nuts") # merge data for each year and each place back into main dataset
+
+
+# code for MIS by impact category in a year
+impacts_dataset$triple_id <-
+  paste0(impacts_dataset$year_nuts,
+         "_",
+         impacts_dataset$type_of_class)
+
+help_MIS <-
+  select(impacts_dataset, triple_id) %>% unique() #extract unique location and years
+
+for (i in 1:length(help_MIS$triple_id)) {
+  help_MIS[i, "MIS_class"] <-
+    sum(filter(impacts_dataset, triple_id == help_MIS[i, 1])$MIS)
+} # Code for calculating total MIS for a year by impact category 
+
+impacts_dataset <- left_join(impacts_dataset, help_MIS, by = "triple_id")
+
+rm(i, help_MIS)
+
+saveRDS(impacts_dataset, "impacts_dataset_control.rds")
+
+impacts_dataset <- readRDS("impacts_dataset_control.rds")
+```
+
+SPI
+```{r}
+spi <- readRDS("stored_dfs.RDS") #load data
+
+spi[, c("october", "november", "december")] <- 
+  sapply(spi[, c("october", "november", "december")], as.numeric) #change all columns to numeric
+
+spi$spi_year <- rowMeans(spi[, c(4:15)], na.rm = TRUE) # calculate average SPI per year
+spi$year_nuts <- paste0(spi$year, "_", spi$nuts_id) # create identifier by year and nuts for merge
+spi <- filter(spi, year >= 2000) #remove data from before 2000 as there are no MIS for that time
+spi <- unique(spi) # remove duplicates, as some were created while scraping
+
+impacts_dataset <- left_join(select(impacts_dataset, -statistical_unit), select(spi, c(spi_year, year_nuts)), by = "year_nuts") 
+```
+
+AGS
+```{r}
+nuts_ags <- read.csv("nuts_ags.csv") # needed for nuts and west / east
+
+impacts_dataset <- left_join(impacts_dataset, select(nuts_ags, nuts_id, ags, east, county, statistical_unit), by = "nuts_id") # merge data
+```
+
+Income
+```{r}
+income <- read_excel("vgrdl_r2b3_bs2022_1.xlsx", sheet = "2.4 (2)") #read data
+income <- gather(income, "year", "income", 9:35) #gather cases of years
+
+#Hamburg and Berlin are only saved wih their NUTS1, thus they are not merged when merged by nuts_id. Therefore I create a specific set for NUTS level 2 and 3 so that they are merged properly.
+
+city_states <- filter(income, Land == "HH" | Land == "BE") #extract the city states
+city_states$`EU-Code` <- paste0(city_states$`EU-Code`, "0") #add the first 0 for Nuts 2
+city_states <- rbind(filter(income, Land == "HH" | Land == "BE"), city_states) #add nuts1 data again to nuts 2
+city_states$`EU-Code` <- paste0(city_states$`EU-Code`, "0") #adding another 0, thus having nuts 2 and 3
+income <- rbind(income, city_states) #bin rows 
+
+income$year_nuts <- paste0(income$year, "_", income$`EU-Code`) #create identifier
+income$income <- as.numeric(income$income) #create to numeric
+
+impacts_dataset <- left_join(impacts_dataset, select(income, c(Land, year_nuts, income)), by = "year_nuts") #merge data
+```
+
+Education
+```{r}
+education <- read_tsv("education.tsv")
+education <- education %>% 
+  filter(sex == "T") %>% 
+  select(-c(freq, unit, isced11, age, sex))
+education <- education %>% 
+  mutate(CTR = substring(education$nuts_2, 1, 2)) %>% 
+  filter(CTR == "DE") %>% 
+  select(-CTR) %>% 
+  gather(year_date, education, 2:13)
+
+nuts_ags <- read.csv("nuts_ags.csv") 
+nuts_ags <- nuts_ags %>% 
+  select(nuts_id) %>% 
+  mutate(nuts_2 = substring(nuts_ags$nuts_id, 1, 4))
+
+education <- left_join(education, nuts_ags, by = "nuts_2")
+education$year_nuts <- paste0(education$year_date, "_", education$nuts_id)
+education$education <- as.numeric(education$education)
+
+impacts_dataset <- left_join(impacts_dataset, select(education, year_nuts, education), by = "year_nuts")
+```
+
+Land use
+```{r}
+#secondly dataset official records:
+
+#https://www.regionalstatistik.de/genesis/online?operation=statistic&levelindex=0&levelid=1700555369114&code=33111#abreadcrumb
+
+# here I am reading the land use data which are separated in several files for different years, near is for years from 2016 onwards, distant for years till 2016; the format of data collection was changed!
+land_use_near <- read.csv("33111-01-02-4.csv", encoding = "UTF-8", sep = ";")
+land_use_near <- rbind(land_use_near, read.csv("33111-01-02-4(1).csv", encoding = "UTF-8", sep = ";"))
+
+# data manipulation to right format and creating new variables
+land_use_near$date <- sub(".*?......","",land_use_near$date) #change date to year
+
+land_use_near <- select(land_use_near, -name) #delete name
+
+land_use_near[] <- sapply( land_use_near, as.numeric ) #change to numeric
+
+#adding combining settlement and infrastructure to one variable
+land_use_near$settlement_transportation <- land_use_near$settlement+land_use_near$transportation
+
+# adding grove to forest to match ALB 
+land_use_near$grove[is.na(land_use_near$grove)] <- 0
+
+land_use_near$forest <- land_use_near$forest +
+  land_use_near$grove
+
+#some areas were reformed, therefore some ags will be deleted, others changed
+land_use_near <- filter(land_use_near, ags != 3152)
+
+land_use <- select(land_use_near, ags, date, agriculture, forest, water_bodies, settlement_transportation)
+
+# dataset for more distant years (till 2016)
+
+land_use_distant <- read.csv("33111-01-01-4(1).csv", encoding = "UTF-8", sep = ";")
+land_use_distant <- rbind(land_use_distant,
+  read.csv("33111-01-01-4(2).csv", encoding = "UTF-8", sep = ";"),
+  read.csv("33111-01-01-4(3).csv", encoding = "UTF-8", sep = ";"),
+  read.csv("33111-01-01-4(4).csv", encoding = "UTF-8", sep = ";")
+) #combine to one dataset
+
+land_use_distant$date <- sub(".*?......","",land_use_distant$date) #change date to year
+
+land_use_distant <- select(land_use_distant, -name) #delete name
+
+land_use_distant[] <- sapply( land_use_distant, as.numeric)# as numeric
+
+#subtracting heath and moor from agriculture in general to match ALKIS
+
+land_use_distant$heath[is.na(land_use_distant$heath)] <- 0
+land_use_distant$moor[is.na(land_use_distant$moor)] <- 0
+
+
+land_use_distant$agriculture <-land_use_distant$agriculture-
+  land_use_distant$heath -
+  land_use_distant$moor
+
+# as before, some areas were reformed, therefore some ags will be deleted, others changed
+land_use_distant <- filter(land_use_distant, ags != 3152)
+
+#there were exstencive changes made to statistical regions in Mecklenburg-Vorpommern, this will be added here
+
+land_use_MV <- read.csv("33111-01-01-4(6).csv", encoding = "UTF-8", sep = ";")
+
+land_use_MV$date <- sub(".*?......","",land_use_MV$date) #change date to year
+land_use_MV <- select(land_use_MV, -name) #delete name
+land_use_MV[] <- sapply( land_use_MV, as.numeric) #to numeric
+
+# subtracting moor and heath from agriculture for ALKIS
+land_use_MV$heath[is.na(land_use_MV$heath)] <- 0
+land_use_MV$moor[is.na(land_use_MV$moor)] <- 0
+
+
+land_use_MV$agriculture <-land_use_MV$agriculture-
+  land_use_MV$heath -
+  land_use_MV$moor
+
+
+land_use_distant <- select(land_use_distant, ags, date, agriculture, 
+                         forest, water_bodies, settlement_transportation)
+land_use_distant <- rbind(land_use_distant, select(land_use_MV, ags, date, agriculture, 
+                         forest, water_bodies, settlement_transportation))
+land_use_distant <- na.omit(land_use_distant)
+
+#combine datasets
+
+land_use <- rbind(land_use, land_use_distant)
+
+nuts_ags <- read.csv("nuts_ags.csv") # ags einlesen
+land_use <- full_join(select(nuts_ags, ags, nuts_id), land_use, by = "ags") #datensatz mergen
+
+# hamburg and berlin are again not saved as nuts 3, therefore I add it
+missings <- filter(land_use, nuts_id %in% c("DE30", "DE60")) #extrac HH and B
+missings$nuts_id <- paste0(missings$nuts_id, "0") #add the missing "0" to the nuts_id
+land_use <- rbind(land_use, missings) #bind them together
+
+# land use was first only publishe every 4 years, this df determines which data land use is used for which year
+year_to_year <- data.frame(year_date = c(2000:2022),
+                           date = c(2000, 2000, 2000, 2004, 2004, 2004, 2004, 2008, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2021)) #create df
+
+land_use <- left_join(land_use, year_to_year, by = "date") #merge data
+land_use$year_nuts <- paste0(land_use$year_date, "_", land_use$nuts_id) #create identifiers
+land_use <- filter(land_use, date > 1999) #throw old data out
+
+impacts_dataset <- left_join(impacts_dataset, 
+                             select(land_use, -c(nuts_id, ags, date, year_date)), 
+                             by = "year_nuts")
+
+impacts_dataset$agriculture <- impacts_dataset$agriculture / 1000
+impacts_dataset$settlement_transportation <- 
+  impacts_dataset$settlement_transportation / 1000
+impacts_dataset$water_bodies <- impacts_dataset$water_bodies / 1000
+impacts_dataset$forest <- impacts_dataset$forest / 1000
+```
+
+Shapefiles
+```{r}
+shape <- read_sf(dsn = ".", layer = "NUTS_RG_20M_2021_3035") %>% #read data
+  filter(CNTR_CODE == "DE") %>%  #delete all countries except for Germany
+select(-c("CNTR_CODE", "NAME_LATN", "FID"))
+
+colnames(shape) <- tolower(colnames(shape))
+
+impacts_dataset <- left_join(impacts_dataset, select(shape, -levl_code), by = "nuts_id")
+```
+
+Drought length
+```{r}
+drought_length <- data.frame(
+  year_date = c(2000:2022),
+  drought_length = c(rep(0, 19), 1, 2, 3, 4)
+)
+
+impacts_dataset <- left_join(impacts_dataset, drought_length, by = "year_date")
+```
+
+Analysis
+```{r}
+impacts <- impacts_dataset
+saveRDS(impacts, "impacts.rds") # merged dataset to work with, may not be perfect yet
+
+impacts <- readRDS("impacts.rds")
+
+rm(land_use, land_use_distant, land_use_MV, land_use_near, missings, year_to_year, income, city_states, spi, drought_length, shape, nuts_ags, education)
+```
+

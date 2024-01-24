@@ -1,0 +1,472 @@
+DISCLAIMER: MIS and DIS are identical. In the code the DIS is sometimes referred to as MIS
+
+packages
+```{r}
+library(tidyverse)
+library(sf)
+library(spdep)      # Diagnosing spatial dependence
+library(spatialreg) # Spatial lag and spatial error model
+
+require(latticeExtra) # USCancerRates, mapplot
+require(maps) # map
+require(classInt) # classIntervals, findCols
+require(grid) # viewport, pushViewport
+require(pals) # brewer.blues, stevens.pinkgreen
+
+require("biscale")
+require("cowplot")
+require("gridExtra")
+require(stargazer) # reporting model outputs
+library(envalysis)
+```
+
+Data
+```{r}
+# read data set
+impacts_year <- readRDS("impacts.rds") %>% select(-c(type_of_class, triple_id, MIS_class, month_date))
+
+# manipulate data to nuts3 and delete 2022
+impacts_year <- filter(impacts_year, statistical_unit == "nuts3")
+impacts_year <- filter(impacts_year, year_date < 2022)
+impacts_year <- distinct(impacts_year, year_nuts, .keep_all = TRUE)
+
+# manipulate income variable
+impacts_year <- impacts_year %>%  #group by year
+  group_by(year_date)
+
+impacts_year <- impacts_year %>%  #scale income
+  mutate(income_scaled = scale(income))
+
+impacts_year$income_scaled <- as.vector(impacts_year$income_scaled) #change from matrix to vector format
+
+impacts_year <- impacts_year %>% #log income
+  mutate(income_log = log(income))
+
+impacts_year <- impacts_year %>% #log & scale income
+  mutate(income_scaled_log = scale(log(income)))
+
+impacts_year$income_scaled_log <- as.vector(impacts_year$income_scaled_log) # matrix to vector
+
+impacts_year <- ungroup(impacts_year) #ungroup
+
+impacts_year$year_date <- as.factor(impacts_year$year_date) #year_date to factor
+```
+
+Heteroscedacity of income, not in the paper
+```{r}
+log_1 <- ggplot() +
+  geom_histogram(filter(impacts_year, year_date %in% c(2003, 2015, 2018, 2019, 2020)), mapping = aes(x = income_log)) +
+  facet_wrap(~year_date)
+
+log_2 <- ggplot() +
+  geom_histogram(filter(impacts_year, year_date %in% c(2003, 2015, 2018, 2019, 2020)), mapping = aes(x = income_scaled)) +
+  facet_wrap(~year_date)
+
+log <- plot_grid(log_1, log_2, 
+                 labels = c("log income", "scaled income"))
+
+ggsave("income.jpg", width = 210, height = 150, units = "mm")
+
+log_3 <- ggplot() +
+  geom_histogram(filter(impacts_year, year_date %in% c(2003, 2015, 2018, 2019, 2020)),
+                 mapping = aes(x = income_scaled_log)) +
+  facet_wrap(~year_date)
+log_3
+
+log <- plot_grid(log_1, log_2, log_3,
+                 labels = c("log income", "scaled income", "log + scaled income"))
+
+ggsave("income_logscaled.jpg", width = 210, height = 150, units = "mm")
+```
+
+Datasets Income & education
+```{r}
+# I create separate datasets for analysis of income and education, I also create the neighbours lists and weights needed for spacial regression analysis
+
+impacts_inc <- filter(impacts_year, year_date %in% c(2003, 2015, 2018, 2019, 2020))
+
+nb_inc <- poly2nb(impacts_inc$geometry, queen = TRUE)
+lw_inc <- nb2listw(nb_inc, style = "W", zero.policy = TRUE)
+
+
+impacts_edu <- filter(impacts_year, year_date %in% c(2015, 2018, 2019, 2020))
+
+nb_edu <- poly2nb(impacts_edu$geometry, queen = TRUE)
+lw_edu <- nb2listw(nb_edu, style = "W", zero.policy = TRUE)
+```
+
+Spatial autocorrelation of DIS
+```{r}
+moran.test(impacts_inc$MIS_year, lw_inc)
+
+# There is spatial autocorrelation!
+```
+
+Choropleth Plots Income / SPI
+```{r}
+# SPI
+
+# create legend
+legend <- bi_legend(pal = rev("BlueGold"),
+                    dim = 3,
+                    xlab = "Higher scaled income",
+                    ylab = "Higher SPI",
+                    size = 12,
+                    flip_axes = TRUE)
+
+# loop to create the plots for the individual years
+pList <- list()
+
+for (i in c(2003, 2018, 2015, 2019, 2020)) {
+  bi_inc <- filter(impacts_inc, year_date %in% c(i))
+  bi_inc <- bi_class(bi_inc, y = income_scaled, x = spi_year, style = "quantile", dim = 3)
+  bi_inc <- st_as_sf(bi_inc)
+map <- ggplot() +
+  geom_sf(bi_inc, mapping = aes(fill = bi_class), color = "white", size = 0.1, show.legend = FALSE) +
+  bi_scale_fill(pal = "BlueGold", dim = 3) +
+  bi_theme()
+print(map)
+   pList[[i]] <- map
+}
+
+# combine the plots in a plot grid and save it
+spi_inc_choropleth <- 
+  plot_grid(pList[[2003]], pList[[2015]], legend, pList[[2018]], pList[[2019]], pList[[2020]],
+            labels = c('2003', "2015", "Legend", '2018', "2019", "2020"))
+
+spi_inc_choropleth
+
+ggsave(file="spi_choropleth_inc.jpg", width = 210, height = 150, units = "mm")
+
+# correlation
+cor(impacts_inc$income_scaled, impacts_inc$spi_year)
+```
+
+Choropleth Plots Income / DIS
+```{r}
+# create legend
+legend <- bi_legend(pal = "PurpleOr",
+                    dim = 3,
+                    xlab = "Higher scaled Income",
+                    ylab = "Higher DIS",
+                    size = 8,
+                    flip_axes = TRUE) 
+
+pList <- list()
+
+# as the DIS has a lot of 0 in 2015, the quartiles are not created properly for the plot. Therefore I change all the 0 by a very little bit so that the quartiles can be computed
+impacts_inc$MIS_year[impacts_inc$MIS_year == 0 & 
+                       impacts_inc$year_date == 2015] <-
+  runif(179, 0, 0.00000000000001)
+
+# creating the plots for the years
+for (i in c(2003, 2018, 2015, 2019, 2020)) {
+  bi_inc <- filter(impacts_inc, year_date %in% c(i))
+  bi_inc <- bi_class(bi_inc, y = income_scaled, x = MIS_year, style = "quantile", dim = 3)
+  bi_inc <- st_as_sf(bi_inc)
+map <- ggplot() +
+  geom_sf(bi_inc, mapping = aes(fill = bi_class), color = "white", size = 0.1, show.legend = FALSE) +
+  bi_scale_fill(pal = "PurpleOr", dim = 3) +
+  bi_theme()
+print(map)
+   pList[[i]] <- map
+}
+
+# combining plots to one
+DIS_inc_choropleth <- 
+  plot_grid(pList[[2003]], pList[[2015]], legend, pList[[2018]], pList[[2019]], pList[[2020]],
+            labels = c('2003', "2015", "Legend", '2018', "2019", "2020"))
+
+DIS_inc_choropleth
+
+ggsave(file="DIS_inc_choropleth.jpg", width = 210, height = 150, units = "mm")
+
+cor(impacts_inc$income_scaled, impacts_inc$MIS_year)
+```
+
+Choropleth Plots Education
+```{r}
+### for SPI
+legend <- bi_legend(pal = rev("BlueGold"),
+                    dim = 3,
+                    xlab = "Higher education",
+                    ylab = "Higher SPI",
+                    size = 12,
+                    flip_axes = TRUE) 
+
+legend
+
+for (i in c(2015, 2018, 2019, 2020)) {
+  bi_edu <- filter(impacts_edu, year_date %in% c(i))
+  bi_edu <- bi_class(bi_edu, y = education, x = spi_year, style = "quantile", dim = 3)
+  bi_edu <- st_as_sf(bi_edu)
+map <- ggplot() +
+  geom_sf(bi_edu, mapping = aes(fill = bi_class), color = "white", size = 0.1, show.legend = FALSE) +
+  bi_scale_fill(pal = "BlueGold", dim = 3) +
+  bi_theme()
+print(map)
+   pList[[i]] <- map
+}
+
+SPI_choropleth <- 
+  plot_grid( "", pList[[2015]],legend, pList[[2018]], pList[[2019]], pList[[2020]],
+            labels = c("","2015", "Legend", '2018', "2019", "2020"))
+
+SPI_choropleth
+
+ggsave(file="SPI_choropleth_edu.jpg", width = 210, height = 150, units = "mm")
+
+cor(impacts_edu$spi_year, impacts_edu$education)
+```
+
+
+```{r}
+### for DIS
+legend <- bi_legend(pal = "PurpleOr",
+                    dim = 3,
+                    xlab = "Higher education",
+                    ylab = "Higher DIS",
+                    size = 8,
+                    flip_axes = TRUE) 
+
+legend
+
+pList <- list()
+
+impacts_edu$MIS_year[impacts_edu$MIS_year == 0 & 
+                       impacts_edu$year_date == 2015] <-
+  runif(179, 0, 0.00000000000001)
+
+for (i in c(2015, 2018, 2019, 2020)) {
+  bi_edu <- filter(impacts_edu, year_date %in% c(i))
+  bi_edu <- bi_class(bi_edu, y = education, x = MIS_year, style = "quantile", dim = 3)
+  bi_edu <- st_as_sf(bi_edu)
+map <- ggplot() +
+  geom_sf(bi_edu, mapping = aes(fill = bi_class), color = "white", size = 0.1, show.legend = FALSE) +
+  bi_scale_fill(pal = "PurpleOr", dim = 3) +
+  bi_theme()
+print(map)
+   pList[[i]] <- map
+}
+
+DIS_choropleth <- 
+  plot_grid("", pList[[2015]],legend, pList[[2018]], pList[[2019]], pList[[2020]],
+            labels = c("", "2015", "Legend", '2018', "2019", "2020"))
+
+DIS_choropleth
+
+ggsave(file="MIS_choropleth_edu.jpg", width = 210, height = 150, units = "mm")
+
+cor(impacts_edu$MIS_year, impacts_edu$education)
+```
+
+Spatial autocorrelation
+```{r}
+DIS.lm <- 
+  lm(MIS_year ~
+       log(income) 
+     + spi_year + east + agriculture + forest + settlement_transportation + water_bodies + as.factor(year_date) + as.factor(year_date)*log(income) + east*log(income), 
+data = impacts_inc
+     )
+
+DIS.lm %>% summary()
+
+impacts_inc$residuals <- residuals(DIS.lm)
+impacts_inc$fitted <- fitted(DIS.lm)
+
+lm.morantest(DIS.lm, lw, zero.policy = T) #spatial effect is there, Moran I is significant
+
+lm.LMtests(DIS.lm, lw, test="LMerr", zero.policy = T) #spatial error model: significant
+
+lm.LMtests(DIS.lm, lw, test="LMlag", zero.policy = T) #spatial lag model: significant
+
+moran.plot(impacts_inc$residuals, lw, zero.policy = TRUE) #plot spatiall lagged values
+
+moran <- moran.mc(impacts_inc$residuals, lw, nsim = 999, zero.policy = TRUE)
+moran
+
+## sensetivity
+ impacts_inc %>% 
+  mutate(lon = list(st_coordinates(.)[, 1]),
+            lat = list(st_coordinates(.)[, 2])) %>% 
+  unnest(lon, lat) %>% 
+  st_drop_geometry()
+ 
+ moran_I <- c()
+ 
+ for (d in seq(50, 2000, 50)) {
+  nb <- dnearneigh(impacts_inc$geometry, d1 = 0, d2 = d)
+  lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+  moran <- moran.mc(DIS.lm$residuals, lw, nsim = 999, zero.policy = TRUE)
+  moran_I <- c(moran_I, moran$statistic)
+ }
+ 
+ #spatial lag model
+```
+
+Hypothethis 2: income
+```{r}
+# 4 spatial error models! 
+
+# just DIS and income
+model_1 <- errorsarlm(MIS_year ~ income_scaled, impacts_inc, lw_inc)
+
+# DIS, income and control
+model_2 <- errorsarlm(MIS_year ~ income_scaled + spi_year + agriculture + forest + settlement_transportation + water_bodies + year_date + east, impacts_inc, lw_inc)
+
+# DIS, income, control and interaction term with east for H2b
+model_3 <- errorsarlm(
+  MIS_year ~ income_scaled + spi_year + agriculture + forest + settlement_transportation + water_bodies + year_date + east + east*income_scaled,
+  impacts_inc,
+  listw = lw_inc,
+  zero.policy = TRUE)
+
+# DIS, income, control and interaction with agiculture for H2c
+model_4 <- errorsarlm(
+  MIS_year ~ income_scaled + spi_year + agriculture + forest + settlement_transportation + water_bodies + year_date + east + income_scaled*agriculture,
+  impacts_inc,
+  listw = lw_inc,
+  zero.policy = TRUE)
+```
+
+Hypothethis 2: eduaction
+```{r}
+# model DIS, education
+model_1_edu <- errorsarlm(MIS_year ~ education, impacts_edu, lw_edu)
+
+# model DIS, education and control
+model_2_edu <- errorsarlm(MIS_year ~ education + spi_year + agriculture + forest + settlement_transportation + water_bodies + year_date + east, impacts_edu, lw_edu)
+
+# labels for stargazer
+labels_1 <- c("Income scaled", 
+                               "Education",
+                               "SPI",
+                               "Agriculture",
+                               "Forestry",
+                               "Settlement + Transport",
+                               "Water",
+                               "2015",
+              "2018",
+              "2019",
+              "2020",
+              "East",
+              "Income:East",
+              "Income:Agriculture")
+
+# stargazer output
+stargazer(model_1, model_1_edu, model_2, model_2_edu, model_3, model_4,
+          out = "model_all.htm",
+          column.sep.width = "10pt",
+          covariate.labels = labels_1,
+          dep.var.labels = "DIS")
+```
+
+Homoscedacity of residuals, not in the work included
+```{r}
+test <- data.frame(
+  fitted = model_2_edu$fitted.values,
+  resid = model_2_edu$residuals
+)
+
+ggplot(test) +
+  geom_point(aes(x = fitted, y = resid))
+
+bptest.Sarlm(model_2_edu)
+
+# heteroscedacity is there...
+```
+
+Hypothesis 3
+```{r}
+# change dataset to only include 2018 - 2020 and create neighbours and weights 
+impacts_3 <- impacts_year %>%
+  ungroup() %>% 
+  filter(year_date %in% c("2018" ,"2019" ,"2020")) %>% 
+  select(nuts_id, MIS_year, spi_year, education, income_scaled, year_date, 
+         geometry, east) %>% 
+  gather("key", "value", 2:5) %>% 
+  unite("year_key", key, year_date) %>% 
+  spread(year_key, value)
+
+nb_3 <- poly2nb(impacts_3$geometry, queen = TRUE)
+lw_3 <- nb2listw(nb_3, style = "W", zero.policy = TRUE)
+
+#calculate how DIS has changed over the time
+
+impacts_3$DIS_diff <- impacts_3$MIS_year_2020 - impacts_3$MIS_year_2018
+impacts_3$DIS_diff19 <- impacts_3$MIS_year_2019 - impacts_3$MIS_year_2018
+
+# calculate how SPI has changed over time
+
+impacts_3$SPI_diff <- impacts_3$spi_year_2020 - impacts_3$spi_year_2018
+impacts_3$SPI_diff19 <- impacts_3$spi_year_2019 - impacts_3$spi_year_2018
+
+# create plots of how DIS has changed relaitve to income / education
+
+diff_1 <- ggplot(impacts_3) +
+  geom_point(aes(x = DIS_diff19, y = income_scaled_2018)) +
+  ylab("Income scaled 2018") +
+  xlab(NULL)+
+  theme_publish()+
+  theme(plot.title.position = "plot")
+
+diff_2 <- ggplot(impacts_3) +
+  geom_point(aes(x = DIS_diff, y = income_scaled_2018)) +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme_publish()+
+  theme(plot.title.position = "plot")
+
+diff_3 <- ggplot(impacts_3) +
+  geom_point(aes(x = DIS_diff19, y = education_2018)) +
+  ylab("Education 2018") +
+  xlab("Development DIS 2018 - 2019") +
+  theme_publish()+
+  theme(plot.title.position = "plot")
+
+diff_4 <- ggplot(impacts_3) +
+  geom_point(aes(x = DIS_diff, y = education_2018)) +
+  xlab("Development DIS 2018 - 2020") +
+  ylab(NULL) +
+  theme_publish()+
+  theme(plot.title.position = "plot")
+
+diff <- plot_grid(diff_1, diff_2, diff_3, diff_4)
+diff
+
+ggsave("Differences_plot.jpg", width = 210, height = 150, units = "mm")
+```
+
+Model Hyp 3
+```{r}
+# four models for H3
+
+# income and change to 2020
+model_diff_inc <- errorsarlm(DIS_diff ~ income_scaled_2018 + SPI_diff + east, impacts_3, lw_3)
+
+# income and change to 2019
+model_diff_inc_19 <- errorsarlm(DIS_diff19 ~ income_scaled_2018 + SPI_diff + east, impacts_3, lw_3)
+
+# education and change to 2020
+model_diff_ed <- errorsarlm(DIS_diff ~ education_2018 + SPI_diff + east, impacts_3, lw_3)
+
+# education and change to 2019
+model_diff_ed_19 <- errorsarlm(DIS_diff19 ~ education_2018 + SPI_diff + east, impacts_3, lw_3)
+
+# labels for stargazer and stargazer output
+labels_2 <- c("Income scaled 2018",
+              "Education 2018",
+              "Development SPI",
+              "East")
+
+stargazer(model_diff_inc_19, model_diff_inc, model_diff_ed_19 ,model_diff_ed, 
+          out = "diff.htm", 
+          single.row = TRUE,
+          covariate.labels = labels_2,
+          dep.var.labels = c("DIS to 2019",
+                             "DIS to 2020",
+                             "DIS to 2019",
+                             "DIS to 2020")
+          )
+```
+
